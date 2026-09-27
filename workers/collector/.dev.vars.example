@@ -1,0 +1,4 @@
+# Local Wrangler values only; production uses `wrangler secret put`.
+WEB_API_ORIGIN=
+COLLECTOR_CONTROL_SECRET=
+COLLECTOR_INGEST_SECRET=

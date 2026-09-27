@@ -1,0 +1,9 @@
+{
+ "$schema":"node_modules/wrangler/config-schema.json",
+ "name":"jjosami-collector", "main":"src/index.ts", "compatibility_date":"2026-09-01",
+ "durable_objects":{"bindings":[{"name":"ROULETTE_COLLECTOR","class_name":"RouletteCollector"}]},
+ "migrations":[{"tag":"v1","new_sqlite_classes":["RouletteCollector"]}],
+ "triggers":{"crons":["*/5 * * * *"]},
+ "vars":{"STREAMER_KEY":"jjosami","COLLECTOR_ENABLED":"false","CATALOG_SYNC_INTERVAL_SECONDS":"1800"},
+ "observability":{"enabled":true,"logs":{"invocation_logs":false}}
+}

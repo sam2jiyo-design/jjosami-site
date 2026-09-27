@@ -1,0 +1,7 @@
+import {PageReady} from '@/components/navigation';
+import {resolvedFields} from '@jjosami/shared';
+import {readSite} from '@/server/read';
+import {External,Icon} from '@/components/ui';
+import {NavLink} from '@/components/navigation';
+export const metadata={title:'프로필'};
+export default async function Page(){const {profile:p,anniversaries}=await readSite();return <><PageReady path="/profile"/><section className="profile-layout profile-expanded"><aside className="profile-identity"><figure className="profile-image"><img src={p.image} alt={p.alt} width="210" height="210"/><figcaption>{p.name}</figcaption></figure><div className="profile-source"><External href={p.channel} className="btn primary" soop>SOOP 방송국</External><External href="https://www.sooplive.com/station/bomyangul/post/207782425">공식 프로필 원문</External></div></aside><div className="profile-copy"><h1>{p.name}</h1>{(p.short||p.bio)&&<dl className="profile-introduction"><div><dt>성격</dt><dd><p className="profile-quote">{p.short}</p><p className="preserve-lines">{p.bio}</p></dd></div></dl>}<dl className="profile-details">{resolvedFields(p,anniversaries).map(f=><div key={f.id} className={'profile-detail '+(f.value.length>18||f.value.includes('\n')?'profile-detail-wide':'')}><dt>{f.label}</dt><dd className="preserve-lines">{f.value}</dd></div>)}</dl><NavLink className="text-link profile-calendar-link" href="/calendar">일정·기념일 보기 <Icon name="arrow"/></NavLink></div></section></>}

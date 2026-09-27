@@ -1,0 +1,11 @@
+import {NextResponse,type NextRequest} from 'next/server';
+import {createServerClient} from '@supabase/ssr';
+export async function proxy(request:NextRequest){
+ const nonce=Buffer.from(crypto.randomUUID()).toString('base64');
+ const storage=process.env.SUPABASE_URL?new URL(process.env.SUPABASE_URL).origin:'';
+ const csp=`default-src 'self'; script-src 'self' 'nonce-${nonce}' 'strict-dynamic' https://challenges.cloudflare.com${process.env.NODE_ENV!=='production'?" 'unsafe-eval'":''}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: ${storage} https://*.sooplive.com https://*.sooplive.co.kr https://*.afreecatv.com https://coverartarchive.org https://archive.org https://*.archive.org https://i.ytimg.com https://img.youtube.com; font-src 'self'; connect-src 'self' https://challenges.cloudflare.com${process.env.NODE_ENV!=='production'?' ws:':''}; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`;
+ const headers=new Headers(request.headers);headers.set('x-nonce',nonce);headers.set('Content-Security-Policy',csp);let response=NextResponse.next({request:{headers}});
+ if((request.nextUrl.pathname.startsWith('/admin')||request.nextUrl.pathname.startsWith('/api/admin'))&&process.env.SUPABASE_URL&&process.env.SUPABASE_PUBLISHABLE_KEY){const client=createServerClient(process.env.SUPABASE_URL,process.env.SUPABASE_PUBLISHABLE_KEY,{cookieOptions:{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax',path:'/'},cookies:{getAll:()=>request.cookies.getAll(),setAll:values=>{values.forEach(({name,value})=>request.cookies.set(name,value));headers.set('cookie',request.headers.get('cookie')||'');response=NextResponse.next({request:{headers}});values.forEach(({name,value,options})=>response.cookies.set(name,value,{...options,httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax',path:'/'}))}}});await client.auth.getUser()}
+ response.headers.set('Content-Security-Policy',csp);if(request.nextUrl.pathname.startsWith('/admin')||request.nextUrl.pathname.startsWith('/api/')){response.headers.set('Cache-Control','no-store');response.headers.set('X-Robots-Tag','noindex, nofollow')}return response;
+}
+export const config={matcher:['/((?!_next/static|_next/image|assets|favicon.ico).*)']};

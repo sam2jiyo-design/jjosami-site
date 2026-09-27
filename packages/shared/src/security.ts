@@ -1,0 +1,6 @@
+const enc=new TextEncoder();
+export const hex=(b:ArrayBuffer)=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');
+export async function digest(body:string){return hex(await crypto.subtle.digest('SHA-256',enc.encode(body)))}
+export async function signature(secret:string,timestamp:string,method:string,path:string,body:string){const key=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);return hex(await crypto.subtle.sign('HMAC',key,enc.encode([timestamp,method.toUpperCase(),path,await digest(body)].join('\n'))))}
+export async function signedHeaders(secret:string,path:string,body:string){const time=String(Math.floor(Date.now()/1000));return {'Content-Type':'application/json','X-Collector-Time':time,'X-Collector-Signature':await signature(secret,time,'POST',path,body)}}
+export async function verifySignature(secret:string,headers:Headers,method:string,path:string,body:string,now=Date.now()){const time=headers.get('X-Collector-Time')||'',sig=headers.get('X-Collector-Signature')||'';if(!secret||!/^\d{10}$/.test(time)||Math.abs(now/1000-Number(time))>300||!/^[a-f0-9]{64}$/.test(sig))return false;const expected=await signature(secret,time,method,path,body);let diff=0;for(let i=0;i<64;i++)diff|=sig.charCodeAt(i)^expected.charCodeAt(i);return diff===0}

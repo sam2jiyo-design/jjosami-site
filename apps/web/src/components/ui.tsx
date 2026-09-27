@@ -1,0 +1,8 @@
+import {icons,soopIcons} from './icons';
+import type {ReactNode} from 'react';
+export function Icon({name,className=''}:{name:string;className?:string}){const soop=soopIcons[name];return <svg className={[className,soop?'soop-icon':'',name==='soop'?'soop-symbol':''].join(' ')} viewBox={soop?.viewBox||'0 0 24 24'} aria-hidden="true" dangerouslySetInnerHTML={{__html:soop?.body||icons[name]||icons.flower}}/>}
+export function External({href,children,className='text-link',soop=false}:{href:string;children:ReactNode;className?:string;soop?:boolean}){return <a className={className} href={href} target="_blank" rel="noopener noreferrer">{soop&&<Icon name="soop"/>}{children}<Icon name="external"/></a>}
+export function Empty({children}:{children:ReactNode}){return <div className="empty-state"><Icon name="paper"/><p>{children}</p></div>}
+export function Heading({children,action}:{children:ReactNode;action?:ReactNode}){return <div className="content-head"><h1>{children}</h1>{action}</div>}
+export function ErrorNote({message}:{message:string}){return message?<p className="form-error" role="alert">{message}</p>:null}
+export function Stars({steps}:{steps:number|null}){return <span className="rating-display" aria-label={steps===null?'난이도 미설정':`체감 난이도 5점 중 ${steps/2}점`}><span className="rating-stars" aria-hidden="true">{[0,1,2,3,4].map(i=><span className="star-shell" key={i}><Icon name="star"/><span className="star-fill" style={{width:Math.max(0,Math.min(100,((steps||0)-i*2)*50))+'%'}}><Icon name="star"/></span></span>)}</span><span className="rating-number">{steps===null?'미설정':(steps/2).toFixed(1)}</span></span>}
