@@ -43,8 +43,14 @@ export class RouletteCollector extends DurableObject<Env>{
   catch{throw new DeliveryError('WEB_ORIGIN_INVALID','Worker의 WEB_API_ORIGIN에 운영 웹사이트의 HTTPS 주소를 설정해 주세요.')}
   if(typeof this.env.COLLECTOR_INGEST_SECRET!=='string'||!this.env.COLLECTOR_INGEST_SECRET)throw new DeliveryError('INGEST_SECRET_MISSING','Worker의 COLLECTOR_INGEST_SECRET이 설정되지 않았습니다.');
   const body=JSON.stringify(data);let response:Response;
-  try{response=await fetch(origin.origin+path,{method:'POST',redirect:'error',headers:await signedHeaders(this.env.COLLECTOR_INGEST_SECRET,path,body),body,signal:AbortSignal.timeout(15000)})}
+  // workerd rejects redirect: 'error' before any network request is made.
+  // Inspect redirects explicitly and never forward the signed payload elsewhere.
+  try{response=await fetch(origin.origin+path,{method:'POST',redirect:'manual',headers:await signedHeaders(this.env.COLLECTOR_INGEST_SECRET,path,body),body,signal:AbortSignal.timeout(15000)})}
   catch{throw new DeliveryError('WEB_NETWORK_ERROR','Worker에서 웹사이트에 연결하지 못했습니다. WEB_API_ORIGIN과 Vercel 접근 설정을 확인해 주세요.')}
+  if(response.status>=300&&response.status<400){
+   await response.body?.cancel().catch(()=>{});
+   throw new DeliveryError('WEB_REDIRECT_REJECTED',`웹사이트가 다른 주소로 이동하도록 응답했습니다. WEB_API_ORIGIN에 리다이렉트 없는 운영 주소를 설정해 주세요. (Vercel HTTP ${response.status})`,response.status);
+  }
   if(!response.ok){
    await response.body?.cancel().catch(()=>{});
    const message=response.status===401?'웹사이트가 수신 인증을 거부했습니다. 양쪽의 COLLECTOR_INGEST_SECRET과 Vercel Deployment Protection을 확인해 주세요.':response.status===403?'웹사이트 접근이 거부되었습니다. Vercel 접근 제한을 확인해 주세요.':response.status===404?'웹사이트의 수신 API를 찾지 못했습니다. Worker의 WEB_API_ORIGIN을 확인해 주세요.':'웹사이트의 수신 API가 요청 처리에 실패했습니다. Vercel 로그를 확인해 주세요.';
