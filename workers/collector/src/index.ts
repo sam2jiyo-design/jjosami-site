@@ -26,8 +26,13 @@ export class RouletteCollector extends DurableObject<Env>{
  private failed(generation:number,message='연결이 끊겼습니다. 단절 구간의 결과를 대조해 주세요.'){
   const s=this.state();if(s.generation!==generation||!s.running)return;const retry=s.retries+1,next=Date.now()+Math.min(60000,1000*2**Math.min(retry,6))*(.75+Math.random()*.5);if(!s.gapFrom)this.ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',Date.now());this.update({connection:'backoff',retries:retry,nextConnectAt:next,lastError:message,gapFrom:s.gapFrom||Date.now(),generation:generation+1});this.close();this.ctx.waitUntil(this.schedule())
  }
- private async openSocket(){if(this.opening||this.socket||!this.state().running)return;const s=this.state(),generation=s.generation;this.opening=true;this.update({connection:'connecting',lastHeartbeatAt:Date.now()});try{
-   const id=s.identity!;const url='https://ssmain.weflab.com/socket.io/?'+new URLSearchParams({EIO:'4',transport:'websocket',idx:id.idx,type:'page',page:'alert'});const response=await fetch(url,{headers:{Upgrade:'websocket'},signal:AbortSignal.timeout(10000)});const socket=response.webSocket;if(!socket||response.status!==101)throw Error('HANDSHAKE');if(this.state().generation!==generation||!this.state().running){socket.accept();socket.close();return}this.socket=socket;socket.accept();
+ private async openSocket(){if(this.opening||this.socket||!this.state().running)return;const s=this.state(),generation=s.generation;this.opening=true;this.update({connection:'connecting',lastHeartbeatAt:Date.now()});
+  // workerd keeps the fetch signal attached to the upgraded WebSocket. Cancel
+  // only a stalled handshake; a live socket is monitored by Engine.IO pings.
+  const handshakeAbort=new AbortController();
+  const handshakeTimeout=setTimeout(()=>handshakeAbort.abort(),10000);
+  try{
+   const id=s.identity!;const url='https://ssmain.weflab.com/socket.io/?'+new URLSearchParams({EIO:'4',transport:'websocket',idx:id.idx,type:'page',page:'alert'});const response=await fetch(url,{headers:{Upgrade:'websocket'},signal:handshakeAbort.signal});clearTimeout(handshakeTimeout);const socket=response.webSocket;if(!socket||response.status!==101)throw Error('HANDSHAKE');if(this.state().generation!==generation||!this.state().running){socket.accept();socket.close();return}this.socket=socket;socket.accept();
    socket.addEventListener('message',event=>{if(this.state().generation!==generation||this.socket!==socket||typeof event.data!=='string')return;const raw=event.data;if(raw.length>65536){this.failed(generation,'허용 크기를 넘는 결과를 수신했습니다. 원본 대조가 필요합니다.');return}
     if(raw.startsWith('0')){try{const info=JSON.parse(raw.slice(1));if(!Number.isFinite(info.pingInterval)||!Number.isFinite(info.pingTimeout)||info.pingInterval<1000||info.pingInterval>120000||info.pingTimeout<1000||info.pingTimeout>120000)throw Error();this.update({pingInterval:info.pingInterval,pingTimeout:info.pingTimeout,lastHeartbeatAt:Date.now()});socket.send('40')}catch{this.failed(generation,'소켓 연결 형식이 변경되었습니다.')}}
     else if(raw==='2'||raw.startsWith('2')){socket.send('3'+raw.slice(1));this.update({lastHeartbeatAt:Date.now()});this.ctx.waitUntil(this.schedule())}
@@ -35,7 +40,7 @@ export class RouletteCollector extends DurableObject<Env>{
     else if(raw.startsWith('44'))this.failed(generation,'결과 서버가 연결을 거부했습니다. 설정을 확인해 주세요.');
     else {const event=packetEvent(raw);if(event){const results=normalizeResults(event,id);for(const result of results){if(this.count()>=20000){this.update({connection:'degraded',lastError:'전송 대기열이 가득 찼습니다. 수집을 중지하고 저장소를 확인해 주세요.',running:false});this.close();break}const receiptId=crypto.randomUUID();this.ctx.storage.sql.exec('INSERT INTO outbox(id,payload,created) VALUES(?,?,?)',receiptId,JSON.stringify({receiptId,streamerKey:this.env.STREAMER_KEY,identityKey:id.idx+':'+id.preset,result}),Date.now());this.update({lastEventAt:Date.now()})}if(results.length)this.ctx.waitUntil(this.flush())}}
    });socket.addEventListener('close',()=>{if(this.socket===socket)this.failed(generation)});socket.addEventListener('error',()=>{if(this.socket===socket)this.failed(generation)});
-  }catch{this.failed(generation,'결과 서버에 연결하지 못했습니다. 잠시 후 다시 연결합니다.')}finally{this.opening=false;await this.schedule()}
+  }catch{this.failed(generation,'결과 서버에 연결하지 못했습니다. 잠시 후 다시 연결합니다.')}finally{clearTimeout(handshakeTimeout);this.opening=false;await this.schedule()}
  }
  private async post(path:string,data:unknown){
   let origin:URL;
