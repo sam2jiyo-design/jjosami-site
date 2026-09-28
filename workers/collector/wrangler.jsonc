@@ -4,6 +4,12 @@
  "durable_objects":{"bindings":[{"name":"ROULETTE_COLLECTOR","class_name":"RouletteCollector"}]},
  "migrations":[{"tag":"v1","new_sqlite_classes":["RouletteCollector"]}],
  "triggers":{"crons":["*/5 * * * *"]},
- "vars":{"STREAMER_KEY":"jjosami","COLLECTOR_ENABLED":"true","CATALOG_SYNC_INTERVAL_SECONDS":"1800"},
+ "vars": {
+  "CATALOG_SYNC_INTERVAL_SECONDS": "1800",
+  "COLLECTOR_CONTROL_SECRET": "71f1f7b664136906a8e1cd166e0360c824c054d3d321699f0e9e1c2d27e7c76b",
+  "COLLECTOR_ENABLED": "true",
+  "COLLECTOR_INGEST_SECRET": "c617916450098d372583e4bf5da6214a9563c5cbc1cdecfa9882e7da6703f7b8",
+  "STREAMER_KEY": "jjosami"
+ },
  "observability":{"enabled":true,"logs":{"invocation_logs":false}}
 }
