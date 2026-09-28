@@ -42,6 +42,41 @@ export class RouletteCollector extends DurableObject<Env>{
  async alarm():Promise<void>{await this.tick()}
 }
 export default {
- async fetch(request:Request,env:Env){const url=new URL(request.url);if(url.pathname!=='/control'||request.method!=='POST')return new Response('Not found',{status:404});if(Number(request.headers.get('content-length'))>8192)return new Response('Too large',{status:413});const reader=request.body?.getReader();const chunks:Uint8Array[]=[];let size=0;if(reader){try{while(true){const r=await reader.read();if(r.done)break;size+=r.value.length;if(size>8192)return new Response('Too large',{status:413});chunks.push(r.value)}}finally{await reader.cancel().catch(()=>{})}}const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length}const body=new TextDecoder().decode(bytes);if(!await verifySignature(env.COLLECTOR_CONTROL_SECRET,request.headers,request.method,url.pathname,body))return new Response('Unauthorized',{status:401});try{const command=JSON.parse(body);if(!/^[a-f0-9-]{36}$/.test(command.commandId)||!['start','stop','reconnect','status'].includes(command.action))return new Response('Invalid command',{status:400});return Response.json({data:await env.ROULETTE_COLLECTOR.getByName(env.STREAMER_KEY).control(command)})}catch{return Response.json({error:'Collector command failed'},{status:503})}},
+ async fetch(request:Request,env:Env):Promise<Response>{
+  const url=new URL(request.url);
+  if(url.pathname!=='/control'||request.method!=='POST')return new Response('Not found',{status:404});
+  if(Number(request.headers.get('content-length'))>8192)return new Response('Too large',{status:413});
+  const reader=request.body?.getReader();const chunks:Uint8Array[]=[];let size=0;
+  if(reader){try{while(true){const r=await reader.read();if(r.done)break;size+=r.value.length;if(size>8192)return new Response('Too large',{status:413});chunks.push(r.value)}}finally{await reader.cancel().catch(()=>{})}}
+  const bytes=new Uint8Array(size);let offset=0;
+  for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length}
+  const body=new TextDecoder().decode(bytes);
+  if(!await verifySignature(env.COLLECTOR_CONTROL_SECRET,request.headers,request.method,url.pathname,body))return Response.json({error:{code:'COLLECTOR_AUTH_FAILED'}},{status:401});
+  let command:Parameters<RouletteCollector['control']>[0];
+  try{
+   const input=JSON.parse(body);
+   if(!input||typeof input.commandId!=='string'||!/^[a-f0-9-]{36}$/.test(input.commandId)||!['start','stop','reconnect','status'].includes(input.action))throw Error();
+   command=input;
+  }catch{return Response.json({error:{code:'COLLECTOR_INVALID_COMMAND'}},{status:400})}
+  let stage='configuration';
+  const fail=(code:string,errorType='Error')=>{
+   // Fixed diagnostic fields only: private alert identities and secrets must never enter logs.
+   console.error(JSON.stringify({event:'collector_control_failed',code,stage,action:command.action,commandId:command.commandId,errorType}));
+   return Response.json({error:{code}},{status:503});
+  };
+  if(!env.ROULETTE_COLLECTOR||typeof env.ROULETTE_COLLECTOR.getByName!=='function')return fail('COLLECTOR_BINDING_MISSING');
+  if(typeof env.STREAMER_KEY!=='string'||!env.STREAMER_KEY.trim())return fail('COLLECTOR_STREAMER_KEY_MISSING');
+  try{
+   stage='durable-object-lookup';
+   const collector=env.ROULETTE_COLLECTOR.getByName(env.STREAMER_KEY);
+   stage='durable-object-control';
+   return Response.json({data:await collector.control(command)});
+  }catch(error){
+   const message=error instanceof Error?error.message:'';
+   const code=message==='COLLECTOR_DISABLED'?'COLLECTOR_DISABLED':message==='INVALID_IDENTITY'?'COLLECTOR_INVALID_IDENTITY':/SQL is not enabled|SQLITE_ERROR|no such table|has no SQL storage/i.test(message)?'COLLECTOR_STORAGE_UNAVAILABLE':'COLLECTOR_INTERNAL_ERROR';
+   const errorType=error instanceof TypeError?'TypeError':error instanceof SyntaxError?'SyntaxError':'Error';
+   return fail(code,errorType);
+  }
+ },
  async scheduled(_controller:ScheduledController,env:Env,ctx:ExecutionContext){ctx.waitUntil(env.ROULETTE_COLLECTOR.getByName(env.STREAMER_KEY).tick())}
 } satisfies ExportedHandler<Env>;
