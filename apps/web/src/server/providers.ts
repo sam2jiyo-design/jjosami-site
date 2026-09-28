@@ -1,6 +1,7 @@
 import 'server-only';
 import {createHash} from 'node:crypto';
 import {youtube,uuid} from '@jjosami/shared';
+import {readSoopBroadcast} from './soop';
 import {AppError,dbError,env,rpc,serviceDb} from './db';
 export async function fetchJson(url:string,hosts:string[],init:RequestInit={},max=524288,timeout=8000,redirects=0):Promise<any>{
  const u=new URL(url);if(u.protocol!=='https:'||!(hosts.includes(u.hostname)||(hosts.includes('archive.org')&&/^(?:ia|dn)[0-9]+\.(?:[a-z]{2}\.)?archive\.org$/.test(u.hostname)))||u.username||u.password||u.port)throw new AppError('PROVIDER_UNAVAILABLE','외부 응답 주소를 확인할 수 없습니다.',503);
@@ -21,4 +22,31 @@ export async function previewVideo(input:string){const url=youtube(input);if(!ur
 export async function candidate(lookupId:string,candidateId:string,provider:string){const {data,error}=await serviceDb().from('songbook_lookup_cache').select('data').eq('id',lookupId).eq('provider',provider).gt('expires_at',new Date().toISOString()).maybeSingle();dbError(error);const c=data?.data?.candidates?.find((x:any)=>x.id===candidateId);if(!c)throw new AppError('LOOKUP_EXPIRED','검색 결과가 만료되었습니다. 다시 조회해 주세요.',409);return c}
 export async function verifyTurnstile(token:string,key:string){const data=await fetchJson('https://challenges.cloudflare.com/turnstile/v0/siteverify',['challenges.cloudflare.com'],{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:env('TURNSTILE_SECRET_KEY'),response:token,idempotency_key:key})},16384,7000);if(!data?.success||data.action!=='photo-request'||data.hostname!==new URL(env('SITE_ORIGIN')).hostname)throw new AppError('CAPTCHA_FAILED','보안 확인이 만료되었거나 실패했습니다. 다시 확인해 주세요.')}
 export type LiveSnapshot={status:'live'|'offline'|'unknown';title:string|null;thumbnailUrl:string|null;channelUrl:string;broadcastUrl:string|null;lastAttemptAt:string|null;lastSuccessAt:string|null;isStale:boolean};
-export async function liveStatus():Promise<LiveSnapshot>{const channel=process.env.SOOP_CHANNEL_ID||'bomyangul',channelUrl='https://www.sooplive.com/station/'+encodeURIComponent(channel),unknown:LiveSnapshot={status:'unknown',title:null,thumbnailUrl:null,channelUrl,broadcastUrl:null,lastAttemptAt:null,lastSuccessAt:null,isStale:true};if(process.env.LIVE_INTEGRATIONS_ENABLED!=='true'||process.env.VERCEL_ENV==='preview')return unknown;const db=serviceDb();const {data:cache}=await db.from('broadcast_cache').select('*').eq('id',true).single();if(cache?.last_success_at&&Date.now()-Date.parse(cache.last_success_at)<60000)return {...cache.data,lastAttemptAt:cache.last_attempt_at,lastSuccessAt:cache.last_success_at,isStale:false};if(!await rpc<boolean>(db,'claim_live_lease'))return {...unknown,lastAttemptAt:cache?.last_attempt_at||null,lastSuccessAt:cache?.last_success_at||null};const at=new Date().toISOString();try{if(!/^[A-Za-z0-9_-]+$/.test(channel))throw Error();const data=await fetchJson('https://chapi.sooplive.co.kr/api/'+channel+'/station',['chapi.sooplive.co.kr'],{},262144,7000);if(!data||!Object.hasOwn(data,'broad'))throw Error();let snap:LiveSnapshot={...unknown,status:'offline',isStale:false,lastAttemptAt:at,lastSuccessAt:at};if(data.broad!==null){const b=data.broad;if(typeof b.broad_title!=='string'||!/^\d+$/.test(String(b.broad_no)))throw Error();let thumbnail:string|null=null;if(typeof b.broad_img==='string'){const t=new URL(b.broad_img.startsWith('//')?'https:'+b.broad_img:b.broad_img);if(t.protocol==='https:'&&/(^|\.)(sooplive\.(com|co\.kr)|afreecatv\.com)$/.test(t.hostname))thumbnail=t.href}snap={...snap,status:'live',title:b.broad_title.slice(0,300),thumbnailUrl:thumbnail,broadcastUrl:'https://play.sooplive.co.kr/'+channel+'/'+b.broad_no}}await db.from('broadcast_cache').update({data:snap,last_success_at:at,lease_until:null}).eq('id',true);return snap}catch{await db.from('broadcast_cache').update({lease_until:null}).eq('id',true);return {...unknown,lastAttemptAt:at,lastSuccessAt:cache?.last_success_at||null}}}
+export async function liveStatus():Promise<LiveSnapshot>{
+ const channel=process.env.SOOP_CHANNEL_ID||'bomyangul',channelUrl='https://www.sooplive.com/station/'+encodeURIComponent(channel);
+ const unknown:LiveSnapshot={status:'unknown',title:null,thumbnailUrl:null,channelUrl,broadcastUrl:null,lastAttemptAt:null,lastSuccessAt:null,isStale:true};
+ if(process.env.LIVE_INTEGRATIONS_ENABLED!=='true'||process.env.VERCEL_ENV==='preview')return unknown;
+ const db=serviceDb();
+ const cached=(row:any,at:string|null=null):LiveSnapshot=>{
+  const recent=row?.data?.channelUrl===channelUrl&&['live','offline'].includes(row.data.status)&&row.last_success_at&&Date.now()-Date.parse(row.last_success_at)<300000;
+  return {...(recent?row.data:unknown),lastAttemptAt:at||row?.last_attempt_at||null,lastSuccessAt:row?.last_success_at||null,isStale:true};
+ };
+ const {data:cache,error}=await db.from('broadcast_cache').select('*').eq('id',true).single();dbError(error);
+ const previous=cached(cache);
+ if(previous.status!=='unknown'&&Date.now()-Date.parse(cache!.last_success_at)<60000)return {...previous,isStale:false};
+ if(!await rpc<boolean>(db,'claim_live_lease')){
+  const {data:latest}=await db.from('broadcast_cache').select('*').eq('id',true).single();
+  const snapshot=cached(latest||cache);
+  return {...snapshot,isStale:!(snapshot.status!=='unknown'&&snapshot.lastSuccessAt&&Date.now()-Date.parse(snapshot.lastSuccessAt)<60000)};
+ }
+ const at=new Date().toISOString();
+ try{
+  const broadcast=await readSoopBroadcast(channel),snap:LiveSnapshot={...unknown,...broadcast,lastAttemptAt:at,lastSuccessAt:at,isStale:false};
+  const saved=await db.from('broadcast_cache').update({data:snap,last_success_at:at,lease_until:null}).eq('id',true);dbError(saved.error);
+  return snap;
+ }catch(e){
+  console.warn('[live] SOOP lookup failed',{code:e instanceof Error?e.message:'UNKNOWN'});
+  await db.from('broadcast_cache').update({lease_until:null}).eq('id',true);
+  return cached(cache,at);
+ }
+}

@@ -2,6 +2,16 @@
 
 운영 구성은 Vercel(Node.js) + Supabase + Cloudflare Workers입니다. 이 ZIP은 정적 HTML이 아니라 설치·빌드할 수 있는 운영 소스 패키지입니다. `apps/web`만 떼어 올리지 말고 패키지 루트 전체를 저장소에 올립니다.
 
+## 2026-09-28 기존 사이트 업데이트 (설치 없이)
+
+현재 배포가 있는 경우 전체 초기 SQL을 다시 실행하지 않습니다.
+
+1. Supabase 프로젝트 → SQL Editor → New query에서 이번 업데이트의 `202609280008_optional_entry_reason.sql`, `202609280009_record_deletion.sql` 내용을 번호 순으로 실행합니다. 008은 기록 사유 선택화, 009는 업보·방셀 신청 삭제 기능입니다. 두 파일은 다시 실행해도 됩니다.
+2. GitHub 저장소에서 Add file → Upload files로 패치 ZIP 안의 `apps`, `packages`, `supabase` 폴더와 문서를 같은 경로에 덮어 올린 뒤 커밋합니다. 기존 파일은 유지합니다.
+3. Vercel의 연결된 Production 배포가 완료될 때까지 기다립니다. 자동 배포가 없으면 최신 커밋을 배포합니다. 이번 변경은 웹과 DB 업데이트이며 Worker 재배포는 필요 없습니다.
+4. Vercel 환경변수 `LIVE_INTEGRATIONS_ENABLED=true`, `SOOP_CHANNEL_ID=bomyangul`을 확인합니다. 값을 바꿨다면 Production 환경에 적용하고 Redeploy합니다. 방송 상태는 최대 약 1분 주기로 갱신됩니다.
+5. 관리자 → 프로필에서 헤더 로고를 업로드한 뒤 저장합니다. 기본 로고로 변경 후 저장하면 업로드 로고가 해제됩니다. 관리자 → 업보 시트 / 방셀 신청에서 삭제 버튼을 확인합니다.
+
 ## 1. Supabase
 
 1. 운영 전용 프로젝트를 만들고 리전을 선택합니다. Vercel 함수 리전은 DB와 가깝게 맞춥니다.
