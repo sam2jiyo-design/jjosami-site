@@ -2,9 +2,12 @@ import {DurableObject} from 'cloudflare:workers';
 import {signedHeaders,verifySignature} from '@jjosami/shared/security';
 import {normalizeResults,packetEvent,type Identity} from '@jjosami/shared/roulette';
 export interface Env {ROULETTE_COLLECTOR:DurableObjectNamespace<RouletteCollector>;STREAMER_KEY:string;WEB_API_ORIGIN:string;COLLECTOR_INGEST_SECRET:string;COLLECTOR_CONTROL_SECRET:string;COLLECTOR_ENABLED:string;CATALOG_SYNC_INTERVAL_SECONDS:string}
-type CollectorStatus={running:boolean;connection:string;lastHeartbeatAt:string|null;lastEventAt:string|null;lastDbSuccessAt:string|null;pendingCount:number;reconnects:number;lastError:string|null;lastCatalogError:string|null;gaps:{started:number;ended:number|null}[]};
-type State={running:boolean;identity:Identity|null;connection:string;generation:number;retries:number;lastHeartbeatAt:number;lastEventAt:number;lastDbSuccessAt:number;nextConnectAt:number;lastCatalogAt:number;lastCatalogAttemptAt:number;lastCatalogError:string|null;lastError:string|null;gapFrom:number|null;pingInterval:number;pingTimeout:number};
-const initial:State={running:false,identity:null,connection:'stopped',generation:0,retries:0,lastHeartbeatAt:0,lastEventAt:0,lastDbSuccessAt:0,nextConnectAt:0,lastCatalogAt:0,lastCatalogAttemptAt:0,lastCatalogError:null,lastError:null,gapFrom:null,pingInterval:25000,pingTimeout:20000};
+type CollectorStatus={running:boolean;connection:string;lastHeartbeatAt:string|null;lastEventAt:string|null;lastDbSuccessAt:string|null;pendingCount:number;reconnects:number;lastError:string|null;lastCatalogError:string|null;lastReportError:string|null;gaps:{started:number;ended:number|null}[]};
+type State={running:boolean;identity:Identity|null;connection:string;generation:number;retries:number;lastHeartbeatAt:number;lastEventAt:number;lastDbSuccessAt:number;nextConnectAt:number;lastCatalogAt:number;lastCatalogAttemptAt:number;lastCatalogError:string|null;lastReportError:string|null;lastError:string|null;gapFrom:number|null;pingInterval:number;pingTimeout:number};
+const initial:State={running:false,identity:null,connection:'stopped',generation:0,retries:0,lastHeartbeatAt:0,lastEventAt:0,lastDbSuccessAt:0,nextConnectAt:0,lastCatalogAt:0,lastCatalogAttemptAt:0,lastCatalogError:null,lastReportError:null,lastError:null,gapFrom:null,pingInterval:25000,pingTimeout:20000};
+class DeliveryError extends Error {
+ constructor(public code:string,message:string,public status?:number){super(message)}
+}
 export class RouletteCollector extends DurableObject<Env>{
  private socket:WebSocket|null=null;private opening=false;private flushing=false;
  constructor(ctx:DurableObjectState,env:Env){super(ctx,env);ctx.blockConcurrencyWhile(async()=>{ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, data TEXT NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created INTEGER NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, result TEXT NOT NULL, created INTEGER NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS gaps (id INTEGER PRIMARY KEY AUTOINCREMENT, started INTEGER NOT NULL, ended INTEGER)');ctx.storage.sql.exec('INSERT OR IGNORE INTO metadata(id,data) VALUES(1,?)',JSON.stringify(initial));const s=this.state();if(s.running&&!s.gapFrom){const since=s.lastHeartbeatAt||Date.now();ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',since);this.update({gapFrom:since,connection:'connecting',generation:s.generation+1,nextConnectAt:Date.now()})}})}
@@ -18,7 +21,7 @@ export class RouletteCollector extends DurableObject<Env>{
   else {const identity=command.identity||s.identity;if(!identity||identity.endpoint!=='https://ssmain.weflab.com'||!identity.idx||!identity.soop)throw Error('INVALID_IDENTITY');if(command.action==='reconnect'||!s.running||JSON.stringify(identity)!==JSON.stringify(s.identity)){this.update({running:true,identity,connection:'connecting',generation:s.generation+1,nextConnectAt:Date.now(),retries:0});this.close()}}
   const result=this.status();this.ctx.storage.sql.exec('INSERT INTO commands(id,result,created) VALUES(?,?,?)',command.commandId,JSON.stringify(result),Date.now());this.ctx.waitUntil(this.tick());return result;
  }
- status():CollectorStatus{const s=this.state();return {running:s.running,connection:s.connection,lastHeartbeatAt:s.lastHeartbeatAt?new Date(s.lastHeartbeatAt).toISOString():null,lastEventAt:s.lastEventAt?new Date(s.lastEventAt).toISOString():null,lastDbSuccessAt:s.lastDbSuccessAt?new Date(s.lastDbSuccessAt).toISOString():null,pendingCount:this.count(),reconnects:s.retries,lastError:s.lastError,lastCatalogError:s.lastCatalogError,gaps:this.ctx.storage.sql.exec<{started:number;ended:number|null}>('SELECT started,ended FROM gaps ORDER BY id DESC LIMIT 20').toArray()}}
+ status():CollectorStatus{const s=this.state();return {running:s.running,connection:s.connection,lastHeartbeatAt:s.lastHeartbeatAt?new Date(s.lastHeartbeatAt).toISOString():null,lastEventAt:s.lastEventAt?new Date(s.lastEventAt).toISOString():null,lastDbSuccessAt:s.lastDbSuccessAt?new Date(s.lastDbSuccessAt).toISOString():null,pendingCount:this.count(),reconnects:s.retries,lastError:s.lastError,lastCatalogError:s.lastCatalogError,lastReportError:s.lastReportError,gaps:this.ctx.storage.sql.exec<{started:number;ended:number|null}>('SELECT started,ended FROM gaps ORDER BY id DESC LIMIT 20').toArray()}}
  private close(){const old=this.socket;this.socket=null;this.opening=false;try{old?.close(1000,'connection replaced')}catch{}}
  private failed(generation:number,message='연결이 끊겼습니다. 단절 구간의 결과를 대조해 주세요.'){
   const s=this.state();if(s.generation!==generation||!s.running)return;const retry=s.retries+1,next=Date.now()+Math.min(60000,1000*2**Math.min(retry,6))*(.75+Math.random()*.5);if(!s.gapFrom)this.ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',Date.now());this.update({connection:'backoff',retries:retry,nextConnectAt:next,lastError:message,gapFrom:s.gapFrom||Date.now(),generation:generation+1});this.close();this.ctx.waitUntil(this.schedule())
@@ -34,9 +37,41 @@ export class RouletteCollector extends DurableObject<Env>{
    });socket.addEventListener('close',()=>{if(this.socket===socket)this.failed(generation)});socket.addEventListener('error',()=>{if(this.socket===socket)this.failed(generation)});
   }catch{this.failed(generation,'결과 서버에 연결하지 못했습니다. 잠시 후 다시 연결합니다.')}finally{this.opening=false;await this.schedule()}
  }
- private async post(path:string,data:unknown){const origin=new URL(this.env.WEB_API_ORIGIN);if(origin.protocol!=='https:')throw Error('INVALID_ORIGIN');const body=JSON.stringify(data);const response=await fetch(origin.origin+path,{method:'POST',redirect:'error',headers:await signedHeaders(this.env.COLLECTOR_INGEST_SECRET,path,body),body,signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error('API_UNAVAILABLE');return response.json() as Promise<any>}
+ private async post(path:string,data:unknown){
+  let origin:URL;
+  try{origin=new URL(this.env.WEB_API_ORIGIN);if(origin.protocol!=='https:'||origin.username||origin.password)throw Error()}
+  catch{throw new DeliveryError('WEB_ORIGIN_INVALID','Worker의 WEB_API_ORIGIN에 운영 웹사이트의 HTTPS 주소를 설정해 주세요.')}
+  if(typeof this.env.COLLECTOR_INGEST_SECRET!=='string'||!this.env.COLLECTOR_INGEST_SECRET)throw new DeliveryError('INGEST_SECRET_MISSING','Worker의 COLLECTOR_INGEST_SECRET이 설정되지 않았습니다.');
+  const body=JSON.stringify(data);let response:Response;
+  try{response=await fetch(origin.origin+path,{method:'POST',redirect:'error',headers:await signedHeaders(this.env.COLLECTOR_INGEST_SECRET,path,body),body,signal:AbortSignal.timeout(15000)})}
+  catch{throw new DeliveryError('WEB_NETWORK_ERROR','Worker에서 웹사이트에 연결하지 못했습니다. WEB_API_ORIGIN과 Vercel 접근 설정을 확인해 주세요.')}
+  if(!response.ok){
+   await response.body?.cancel().catch(()=>{});
+   const message=response.status===401?'웹사이트가 수신 인증을 거부했습니다. 양쪽의 COLLECTOR_INGEST_SECRET과 Vercel Deployment Protection을 확인해 주세요.':response.status===403?'웹사이트 접근이 거부되었습니다. Vercel 접근 제한을 확인해 주세요.':response.status===404?'웹사이트의 수신 API를 찾지 못했습니다. Worker의 WEB_API_ORIGIN을 확인해 주세요.':'웹사이트의 수신 API가 요청 처리에 실패했습니다. Vercel 로그를 확인해 주세요.';
+   throw new DeliveryError('WEB_HTTP_'+response.status,message+` (Vercel HTTP ${response.status})`,response.status);
+  }
+  const reader=response.body?.getReader();if(!reader)throw new DeliveryError('WEB_RESPONSE_INVALID','웹사이트가 비어 있는 응답을 반환했습니다.');
+  const chunks:Uint8Array[]=[];let size=0;
+  try{
+   while(true){const part=await reader.read();if(part.done)break;size+=part.value.length;if(size>65536)throw Error();chunks.push(part.value)}
+   const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length}
+   return JSON.parse(new TextDecoder().decode(bytes));
+  }catch{throw new DeliveryError('WEB_RESPONSE_INVALID','웹사이트의 API 응답 형식이 올바르지 않습니다. WEB_API_ORIGIN과 Vercel 접근 설정을 확인해 주세요.')}
+  finally{await reader.cancel().catch(()=>{})}
+ }
  private async flush(){if(this.flushing)return;this.flushing=true;try{const rows=this.ctx.storage.sql.exec<{id:string;payload:string}>('SELECT id,payload FROM outbox ORDER BY created LIMIT 50').toArray();let bytes=0;const batch=[];for(const row of rows){if(bytes+new TextEncoder().encode(row.payload).length>240000)break;bytes+=new TextEncoder().encode(row.payload).length;batch.push(JSON.parse(row.payload))}if(!batch.length)return;const response=await this.post('/api/internal/weflab/events',{schemaVersion:1,events:batch});let acknowledged=0;for(const ack of response.data?.results||[]){if(batch.some(e=>e.receiptId===ack.receiptId)&&/^[a-f0-9-]{36}$/.test(ack.id||'')&&['applied','duplicate','review_required','ignored'].includes(ack.status)){this.ctx.storage.sql.exec('DELETE FROM outbox WHERE id=?',ack.receiptId);acknowledged++}}if(acknowledged)this.update({lastDbSuccessAt:Date.now(),lastError:this.count()?this.state().lastError:null});else this.update({lastError:'저장 확인이 없어 같은 결과의 전송을 재시도합니다.'})}catch{this.update({lastError:'결과 전송을 재시도하고 있습니다. 수신한 결과는 대기열에 보존됩니다.'})}finally{this.flushing=false;await this.schedule()}}
- private async report(){try{await this.post('/api/internal/weflab/state',{state:this.status(),observedAt:new Date().toISOString()})}catch{} }
+ private async report(){
+  try{
+   const response=await this.post('/api/internal/weflab/state',{state:{...this.status(),lastReportError:null},observedAt:new Date().toISOString()});
+   if(response?.data?.stored!==true)throw new DeliveryError('STATE_NOT_STORED','웹사이트에서 상태 저장을 확인하지 못했습니다.');
+   this.update({lastReportError:null});
+  }catch(error){
+   const detail=error instanceof DeliveryError?error:new DeliveryError('STATE_REPORT_FAILED','웹사이트에 상태를 전달하지 못했습니다.');
+   const message='상태 전달 실패: '+detail.message;
+   if(this.state().lastReportError!==message)console.error(JSON.stringify({event:'collector_state_report_failed',code:detail.code,upstreamStatus:detail.status}));
+   this.update({lastReportError:message});
+  }
+ }
  private async schedule(){const s=this.state();if(!s.running&&!this.count()){await this.ctx.storage.deleteAlarm();return}const now=Date.now();const due=s.running&&this.socket?s.lastHeartbeatAt+s.pingInterval+s.pingTimeout:s.running?s.nextConnectAt||now+1000:now+30000;await this.ctx.storage.setAlarm(Math.max(now+1000,Math.min(due,now+(this.count()?15000:60000))))}
  async tick():Promise<void>{const s=this.state();if(s.running&&this.env.COLLECTOR_ENABLED!=='true'){this.update({running:false,connection:'stopped',generation:s.generation+1});this.close()}else if(s.running){if(this.socket&&Date.now()-s.lastHeartbeatAt>s.pingInterval+s.pingTimeout)this.failed(s.generation,'서버 응답이 지연되어 다시 연결합니다.');if(!this.socket&&!this.opening&&Date.now()>=this.state().nextConnectAt)await this.openSocket();if(Date.now()-s.lastCatalogAt>Number(this.env.CATALOG_SYNC_INTERVAL_SECONDS||1800)*1000&&Date.now()-s.lastCatalogAttemptAt>60000){this.update({lastCatalogAttemptAt:Date.now()});try{await this.post('/api/internal/weflab/catalog/sync',{});this.update({lastCatalogAt:Date.now(),lastCatalogError:null})}catch{this.update({lastCatalogError:'룰렛 목록을 갱신하지 못했습니다. 마지막 정상 목록을 사용합니다.'})}}}await this.flush();await this.report();await this.schedule()}
  async alarm():Promise<void>{await this.tick()}

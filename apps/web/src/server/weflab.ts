@@ -68,5 +68,19 @@ export async function controlCollector(action:string,commandId:string){
  if(!record(payload?.data))return fail('COLLECTOR_INVALID_RESPONSE','Worker 응답에 수집 상태가 없습니다. 배포된 Worker 코드를 확인해 주세요.',response.status);
  return payload!.data;
 }
-export async function integrationStatus(){const db=serviceDb();const [settings,catalog,mappings,state,reviews]=await Promise.all([collectorSettings(),db.from('roulette_catalog').select('data,last_success_at').eq('id',true).maybeSingle(),db.from('roulette_mappings').select('*'),db.from('collector_state').select('*').eq('id',true).maybeSingle(),db.from('roulette_events').select('id',{count:'exact',head:true}).eq('status','review_required')]);for(const r of [catalog,mappings,state,reviews])dbError(r.error);return {settings,catalog:catalog.data?.data||null,lastCatalogAt:catalog.data?.last_success_at||null,mappings:mappings.data||[],state:state.data?{...state.data.data,observedAt:state.data.observed_at}:null,reviewCount:reviews.count||0}}
+export async function integrationStatus(){
+ const db=serviceDb();
+ // The callback can fail independently of the command channel. Read the Worker
+ // itself so missing DB reports never imply that collection has not started.
+ const current=controlCollector('status',crypto.randomUUID()).then(data=>({state:{...record(data),observedAt:new Date().toISOString()},error:null})).catch(error=>({state:null,error:error instanceof AppError?error.message:'수집기의 현재 상태를 확인하지 못했습니다.'}));
+ const [settings,catalog,mappings,saved,reviews,live]=await Promise.all([
+  collectorSettings(),db.from('roulette_catalog').select('data,last_success_at').eq('id',true).maybeSingle(),
+  db.from('roulette_mappings').select('*'),db.from('collector_state').select('*').eq('id',true).maybeSingle(),
+  db.from('roulette_events').select('id',{count:'exact',head:true}).eq('status','review_required'),current
+ ]);
+ for(const result of [catalog,mappings,saved,reviews])dbError(result.error);
+ return {settings,catalog:catalog.data?.data||null,lastCatalogAt:catalog.data?.last_success_at||null,mappings:mappings.data||[],
+  state:live.state||(saved.data?{...saved.data.data,observedAt:saved.data.observed_at}:null),statusError:live.error,
+  lastReportedAt:saved.data?.observed_at||null,reviewCount:reviews.count||0};
+}
 export async function ingestEvents(events:any[]){const db=serviceDb();const {data:catalog}=await db.from('roulette_catalog').select('data').eq('id',true).maybeSingle();const results=[];for(const e of events){const r=e.result;const clean={source:r.source,sourceEventId:r.sourceEventId,drawIndex:r.drawIndex,platform:r.platform,soop:r.soop,nickname:r.nickname,itemName:r.itemName,donation:r.donation,occurredAt:r.occurredAt};const sourceKey=r.sourceEventId&&r.drawIndex!==null?[env('STREAMER_KEY'),e.identityKey,r.platform,r.sourceEventId,r.drawIndex].join(':'):null;let status=r.status,reason=r.reason,mappingKey=null;if(status==='ready'){const matches=(catalog?.data?.groups||[]).flatMap((g:any)=>g.ranges.some((range:any)=>range.platform===r.platform&&r.donation>=range.min&&(range.max===null||r.donation<=range.max))?g.items.filter((i:any)=>i.name===r.itemName).map((i:any)=>g.id+':'+i.id):[]);if(matches.length===1)mappingKey=matches[0];else{status='review_required';reason=matches.length?'여러 룰렛에 같은 결과가 있습니다.':'연결할 룰렛 항목을 찾지 못했습니다.'}}try{results.push(await rpc(db,'ingest_result',{p_receipt:e.receiptId,p_source_key:sourceKey,p_payload:clean,p_mapping_key:mappingKey,p_status:status,p_reason:reason}))}catch{results.push({receiptId:e.receiptId,status:'retry'})}}return {results}}
