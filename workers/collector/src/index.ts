@@ -1,19 +1,35 @@
 import {DurableObject} from 'cloudflare:workers';
 import {signedHeaders,verifySignature} from '@jjosami/shared/security';
-import {normalizeResults,packetEvent,type Identity} from '@jjosami/shared/roulette';
+import {normalizeResults,packetEvent,type Identity,type RouletteResult} from '@jjosami/shared/roulette';
+import {channels,subscription,donationDetails,eventKey,resultEnvelope,mergedResults,type Channel,type Donation} from './protocol';
 export interface Env {ROULETTE_COLLECTOR:DurableObjectNamespace<RouletteCollector>;STREAMER_KEY:string;WEB_API_ORIGIN:string;COLLECTOR_INGEST_SECRET:string;COLLECTOR_CONTROL_SECRET:string;COLLECTOR_ENABLED:string;CATALOG_SYNC_INTERVAL_SECONDS:string}
-type CollectorStatus={running:boolean;connection:string;lastHeartbeatAt:string|null;lastEventAt:string|null;lastDbSuccessAt:string|null;pendingCount:number;reconnects:number;lastError:string|null;lastCatalogError:string|null;lastReportError:string|null;gaps:{started:number;ended:number|null}[]};
-type State={running:boolean;identity:Identity|null;connection:string;generation:number;retries:number;lastHeartbeatAt:number;lastEventAt:number;lastDbSuccessAt:number;nextConnectAt:number;lastCatalogAt:number;lastCatalogAttemptAt:number;lastCatalogError:string|null;lastReportError:string|null;lastError:string|null;gapFrom:number|null;pingInterval:number;pingTimeout:number};
-const initial:State={running:false,identity:null,connection:'stopped',generation:0,retries:0,lastHeartbeatAt:0,lastEventAt:0,lastDbSuccessAt:0,nextConnectAt:0,lastCatalogAt:0,lastCatalogAttemptAt:0,lastCatalogError:null,lastReportError:null,lastError:null,gapFrom:null,pingInterval:25000,pingTimeout:20000};
+type CollectorStatus={running:boolean;connection:string;channels:Record<Channel,string>;lastHeartbeatAt:string|null;lastDonationAt:string|null;lastEventAt:string|null;lastDbSuccessAt:string|null;pendingCount:number;pendingMatchCount:number;reconnects:number;lastError:string|null;lastCatalogError:string|null;lastReportError:string|null;gaps:{started:number;ended:number|null}[]};
+type State={running:boolean;identity:Identity|null;connection:string;generation:number;retries:number;lastHeartbeatAt:number;lastDonationAt:number;lastEventAt:number;lastDbSuccessAt:number;nextConnectAt:number;lastCatalogAt:number;lastCatalogAttemptAt:number;lastCatalogError:string|null;lastReportError:string|null;lastError:string|null;gapFrom:number|null};
+const initial:State={running:false,identity:null,connection:'stopped',generation:0,retries:0,lastHeartbeatAt:0,lastDonationAt:0,lastEventAt:0,lastDbSuccessAt:0,nextConnectAt:0,lastCatalogAt:0,lastCatalogAttemptAt:0,lastCatalogError:null,lastReportError:null,lastError:null,gapFrom:null};
+type Link={socket:WebSocket|null;abort:AbortController;timer:ReturnType<typeof setTimeout>;ready:boolean;lastHeartbeatAt:number;connectDeadline:number;pingInterval:number;pingTimeout:number};
+type PendingResult={id:string;payload:string;created:number};
+const MATCH_WAIT_MS=15000,CONTEXT_TTL_MS=24*60*60*1000,QUEUE_LIMIT=20000;
 class DeliveryError extends Error {
  constructor(public code:string,message:string,public status?:number){super(message)}
 }
 export class RouletteCollector extends DurableObject<Env>{
- private socket:WebSocket|null=null;private opening=false;private flushing=false;
- constructor(ctx:DurableObjectState,env:Env){super(ctx,env);ctx.blockConcurrencyWhile(async()=>{ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, data TEXT NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created INTEGER NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, result TEXT NOT NULL, created INTEGER NOT NULL)');ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS gaps (id INTEGER PRIMARY KEY AUTOINCREMENT, started INTEGER NOT NULL, ended INTEGER)');ctx.storage.sql.exec('INSERT OR IGNORE INTO metadata(id,data) VALUES(1,?)',JSON.stringify(initial));const s=this.state();if(s.running&&!s.gapFrom){const since=s.lastHeartbeatAt||Date.now();ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',since);this.update({gapFrom:since,connection:'connecting',generation:s.generation+1,nextConnectAt:Date.now()})}})}
+ private links=new Map<Channel,Link>();private flushing=false;
+ constructor(ctx:DurableObjectState,env:Env){super(ctx,env);ctx.blockConcurrencyWhile(async()=>{
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, data TEXT NOT NULL)');
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created INTEGER NOT NULL)');
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, result TEXT NOT NULL, created INTEGER NOT NULL)');
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS gaps (id INTEGER PRIMARY KEY AUTOINCREMENT, started INTEGER NOT NULL, ended INTEGER)');
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS donations (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created INTEGER NOT NULL)');
+  ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS donations_created ON donations(created)');
+  ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS pending_results (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created INTEGER NOT NULL)');
+  ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS pending_results_created ON pending_results(created)');
+  ctx.storage.sql.exec('INSERT OR IGNORE INTO metadata(id,data) VALUES(1,?)',JSON.stringify(initial));
+  const s=this.state();if(s.running){const since=s.gapFrom||s.lastHeartbeatAt||Date.now();if(!s.gapFrom)ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',since);this.update({gapFrom:since,connection:'connecting',generation:s.generation+1,nextConnectAt:Date.now()})}
+ })}
  private state(){return {...initial,...JSON.parse(this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM metadata WHERE id=1').one().data)} as State}
  private update(patch:Partial<State>){const s={...this.state(),...patch};this.ctx.storage.sql.exec('UPDATE metadata SET data=? WHERE id=1',JSON.stringify(s));return s}
  private count(){return this.ctx.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM outbox').one().n}
+ private matchingCount(){return this.ctx.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM pending_results').one().n}
  async control(command:{commandId:string;action:'start'|'stop'|'reconnect'|'status';identity?:Identity}):Promise<CollectorStatus>{
   if(command.action==='status')return this.status();const prior=this.ctx.storage.sql.exec<{result:string}>('SELECT result FROM commands WHERE id=?',command.commandId).toArray()[0];if(prior)return JSON.parse(prior.result);
   if(command.action!=='stop'&&this.env.COLLECTOR_ENABLED!=='true')throw Error('COLLECTOR_DISABLED');
@@ -21,26 +37,94 @@ export class RouletteCollector extends DurableObject<Env>{
   else {const identity=command.identity||s.identity;if(!identity||identity.endpoint!=='https://ssmain.weflab.com'||!identity.idx||!identity.soop)throw Error('INVALID_IDENTITY');if(command.action==='reconnect'||!s.running||JSON.stringify(identity)!==JSON.stringify(s.identity)){this.update({running:true,identity,connection:'connecting',generation:s.generation+1,nextConnectAt:Date.now(),retries:0});this.close()}}
   const result=this.status();this.ctx.storage.sql.exec('INSERT INTO commands(id,result,created) VALUES(?,?,?)',command.commandId,JSON.stringify(result),Date.now());this.ctx.waitUntil(this.tick());return result;
  }
- status():CollectorStatus{const s=this.state();return {running:s.running,connection:s.connection,lastHeartbeatAt:s.lastHeartbeatAt?new Date(s.lastHeartbeatAt).toISOString():null,lastEventAt:s.lastEventAt?new Date(s.lastEventAt).toISOString():null,lastDbSuccessAt:s.lastDbSuccessAt?new Date(s.lastDbSuccessAt).toISOString():null,pendingCount:this.count(),reconnects:s.retries,lastError:s.lastError,lastCatalogError:s.lastCatalogError,lastReportError:s.lastReportError,gaps:this.ctx.storage.sql.exec<{started:number;ended:number|null}>('SELECT started,ended FROM gaps ORDER BY id DESC LIMIT 20').toArray()}}
- private close(){const old=this.socket;this.socket=null;this.opening=false;try{old?.close(1000,'connection replaced')}catch{}}
+ status():CollectorStatus{const s=this.state();return {running:s.running,connection:s.connection,channels:Object.fromEntries(channels.map(c=>[c,this.links.get(c)?.ready?'connected':s.running?s.connection==='backoff'?'backoff':'connecting':'stopped'])) as Record<Channel,string>,lastHeartbeatAt:s.lastHeartbeatAt?new Date(s.lastHeartbeatAt).toISOString():null,lastDonationAt:s.lastDonationAt?new Date(s.lastDonationAt).toISOString():null,lastEventAt:s.lastEventAt?new Date(s.lastEventAt).toISOString():null,lastDbSuccessAt:s.lastDbSuccessAt?new Date(s.lastDbSuccessAt).toISOString():null,pendingCount:this.count(),pendingMatchCount:this.matchingCount(),reconnects:s.retries,lastError:s.lastError,lastCatalogError:s.lastCatalogError,lastReportError:s.lastReportError,gaps:this.ctx.storage.sql.exec<{started:number;ended:number|null}>('SELECT started,ended FROM gaps ORDER BY id DESC LIMIT 20').toArray()}}
+ private close(){const old=[...this.links.values()];this.links.clear();for(const link of old){clearTimeout(link.timer);try{if(link.socket)link.socket.close(1000,'connection replaced');else link.abort.abort()}catch{}}}
  private failed(generation:number,message='연결이 끊겼습니다. 단절 구간의 결과를 대조해 주세요.'){
   const s=this.state();if(s.generation!==generation||!s.running)return;const retry=s.retries+1,next=Date.now()+Math.min(60000,1000*2**Math.min(retry,6))*(.75+Math.random()*.5);if(!s.gapFrom)this.ctx.storage.sql.exec('INSERT INTO gaps(started) VALUES(?)',Date.now());this.update({connection:'backoff',retries:retry,nextConnectAt:next,lastError:message,gapFrom:s.gapFrom||Date.now(),generation:generation+1});this.close();this.ctx.waitUntil(this.schedule())
  }
- private async openSocket(){if(this.opening||this.socket||!this.state().running)return;const s=this.state(),generation=s.generation;this.opening=true;this.update({connection:'connecting',lastHeartbeatAt:Date.now()});
-  // workerd keeps the fetch signal attached to the upgraded WebSocket. Cancel
-  // only a stalled handshake; a live socket is monitored by Engine.IO pings.
-  const handshakeAbort=new AbortController();
-  const handshakeTimeout=setTimeout(()=>handshakeAbort.abort(),10000);
+ private async openSocket(channel:Channel){
+  if(this.links.has(channel)||!this.state().running)return;
+  const s=this.state(),generation=s.generation,id=s.identity!,spec=subscription(channel,id),abort=new AbortController();
+  const link:Link={socket:null,abort,timer:setTimeout(()=>abort.abort(),10000),ready:false,lastHeartbeatAt:Date.now(),connectDeadline:Date.now()+10000,pingInterval:25000,pingTimeout:20000};
+  this.links.set(channel,link);this.update({connection:'connecting'});
+  const current=()=>this.state().generation===generation&&this.state().running&&this.links.get(channel)===link;
   try{
-   const id=s.identity!;const url='https://ssmain.weflab.com/socket.io/?'+new URLSearchParams({EIO:'4',transport:'websocket',idx:id.idx,type:'page',page:'alert'});const response=await fetch(url,{headers:{Upgrade:'websocket'},signal:handshakeAbort.signal});clearTimeout(handshakeTimeout);const socket=response.webSocket;if(!socket||response.status!==101)throw Error('HANDSHAKE');if(this.state().generation!==generation||!this.state().running){socket.accept();socket.close();return}this.socket=socket;socket.accept();
-   socket.addEventListener('message',event=>{if(this.state().generation!==generation||this.socket!==socket||typeof event.data!=='string')return;const raw=event.data;if(raw.length>65536){this.failed(generation,'허용 크기를 넘는 결과를 수신했습니다. 원본 대조가 필요합니다.');return}
-    if(raw.startsWith('0')){try{const info=JSON.parse(raw.slice(1));if(!Number.isFinite(info.pingInterval)||!Number.isFinite(info.pingTimeout)||info.pingInterval<1000||info.pingInterval>120000||info.pingTimeout<1000||info.pingTimeout>120000)throw Error();this.update({pingInterval:info.pingInterval,pingTimeout:info.pingTimeout,lastHeartbeatAt:Date.now()});socket.send('40')}catch{this.failed(generation,'소켓 연결 형식이 변경되었습니다.')}}
-    else if(raw==='2'||raw.startsWith('2')){socket.send('3'+raw.slice(1));this.update({lastHeartbeatAt:Date.now()});this.ctx.waitUntil(this.schedule())}
-    else if(raw.startsWith('40')){socket.send('42'+JSON.stringify(['msg',{type:'join',page:'page',idx:id.idx,pageid:'alert',preset:id.preset}]));this.update({connection:'connected',lastHeartbeatAt:Date.now(),lastError:null,nextConnectAt:0});if(s.gapFrom)this.ctx.storage.sql.exec('UPDATE gaps SET ended=? WHERE ended IS NULL',Date.now());this.update({gapFrom:null});this.ctx.waitUntil(this.report())}
-    else if(raw.startsWith('44'))this.failed(generation,'결과 서버가 연결을 거부했습니다. 설정을 확인해 주세요.');
-    else {const event=packetEvent(raw);if(event){const results=normalizeResults(event,id);for(const result of results){if(this.count()>=20000){this.update({connection:'degraded',lastError:'전송 대기열이 가득 찼습니다. 수집을 중지하고 저장소를 확인해 주세요.',running:false});this.close();break}const receiptId=crypto.randomUUID();this.ctx.storage.sql.exec('INSERT INTO outbox(id,payload,created) VALUES(?,?,?)',receiptId,JSON.stringify({receiptId,streamerKey:this.env.STREAMER_KEY,identityKey:id.idx+':'+id.preset,result}),Date.now());this.update({lastEventAt:Date.now()})}if(results.length)this.ctx.waitUntil(this.flush())}}
-   });socket.addEventListener('close',()=>{if(this.socket===socket)this.failed(generation)});socket.addEventListener('error',()=>{if(this.socket===socket)this.failed(generation)});
-  }catch{this.failed(generation,'결과 서버에 연결하지 못했습니다. 잠시 후 다시 연결합니다.')}finally{clearTimeout(handshakeTimeout);this.opening=false;await this.schedule()}
+   const response=await fetch(spec.url,{headers:{Upgrade:'websocket'},signal:abort.signal});
+   // Leaving an AbortSignal timeout active after upgrade closes a healthy socket.
+   clearTimeout(link.timer);
+   const socket=response.webSocket;if(!socket||response.status!==101)throw Error('HANDSHAKE');
+   socket.accept();if(!current()){socket.close();return}link.socket=socket;
+   socket.addEventListener('message',event=>{
+    if(!current()||typeof event.data!=='string')return;
+    const raw=event.data;if(raw.length>65536){this.failed(generation,'허용 크기를 넘는 결과를 수신했습니다. 원본 대조가 필요합니다.');return}
+    try{
+     if(raw.startsWith('0')){
+      const info=JSON.parse(raw.slice(1));
+      if(!Number.isFinite(info.pingInterval)||!Number.isFinite(info.pingTimeout)||info.pingInterval<1000||info.pingInterval>120000||info.pingTimeout<1000||info.pingTimeout>120000)throw Error('PROTOCOL');
+      link.pingInterval=info.pingInterval;link.pingTimeout=info.pingTimeout;link.lastHeartbeatAt=Date.now();socket.send('40');
+     }else if(raw.startsWith('2')){
+      socket.send('3'+raw.slice(1));link.lastHeartbeatAt=Date.now();this.update({lastHeartbeatAt:Date.now()});this.ctx.waitUntil(this.schedule());
+     }else if(raw.startsWith('40')){
+      if(link.ready)return;
+      socket.send('42'+JSON.stringify(['msg',spec.join]));link.ready=true;link.lastHeartbeatAt=Date.now();
+      if(channels.every(c=>this.links.get(c)?.ready)){
+       this.update({connection:'connected',lastHeartbeatAt:Date.now(),lastError:null,nextConnectAt:0,gapFrom:null});
+       this.ctx.storage.sql.exec('UPDATE gaps SET ended=? WHERE ended IS NULL',Date.now());this.ctx.waitUntil(this.report());
+      }
+      this.ctx.waitUntil(this.schedule());
+     }else if(raw.startsWith('44')||raw==='1'||raw.startsWith('41')){
+      this.failed(generation,'수신 채널이 연결을 종료했습니다. 다시 연결합니다.');
+     }else{
+      const message=packetEvent(raw);if(message)this.receive(channel,message,id);
+     }
+    }catch{this.failed(generation,'수신 메시지를 처리하지 못했습니다. 원본 결과를 대조해 주세요.')}
+   });
+   socket.addEventListener('close',()=>{if(current())this.failed(generation)});
+   socket.addEventListener('error',()=>{if(current())this.failed(generation)});
+  }catch{if(current())this.failed(generation,(channel==='results'?'룰렛 결과':'SOOP 후원')+' 서버에 연결하지 못했습니다. 잠시 후 다시 연결합니다.')}
+  finally{clearTimeout(link.timer);await this.schedule()}
+ }
+ private donation(key:string){const row=this.ctx.storage.sql.exec<{payload:string}>('SELECT payload FROM donations WHERE id=? AND created>?',key,Date.now()-CONTEXT_TTL_MS).toArray()[0];return row?JSON.parse(row.payload) as Donation:null}
+ private enqueue(results:RouletteResult[],identity:Identity){
+  if(this.count()+results.length>QUEUE_LIMIT){this.update({running:false,connection:'degraded',lastError:'전송 대기열이 가득 찼습니다. 저장소를 확인해 주세요.'});this.close();return false}
+  for(const result of results){const receiptId=crypto.randomUUID();this.ctx.storage.sql.exec('INSERT INTO outbox(id,payload,created) VALUES(?,?,?)',receiptId,JSON.stringify({receiptId,streamerKey:this.env.STREAMER_KEY,identityKey:identity.idx+':'+identity.preset,result}),Date.now())}
+  return true;
+ }
+ private receive(channel:Channel,message:any,identity:Identity){
+  if(channel==='donations'){
+   const incoming=donationDetails(message,identity);if(!incoming)return;
+   const key=eventKey(identity,incoming.uid),prior=this.donation(key);
+   const conflict=prior&&(prior.id!==incoming.id||prior.name!==incoming.name||prior.value!==incoming.value);
+   const donation=prior?{...prior,mode:conflict?'conflict':prior.mode,test:prior.test||incoming.test,replay:prior.replay||incoming.replay}:incoming;
+   this.ctx.storage.sql.exec('DELETE FROM donations WHERE created<?',Date.now()-CONTEXT_TTL_MS);
+   this.ctx.storage.sql.exec('INSERT INTO donations(id,payload,created) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',key,JSON.stringify(donation),Date.now());
+   this.ctx.storage.sql.exec('DELETE FROM donations WHERE id IN (SELECT id FROM donations ORDER BY created DESC LIMIT -1 OFFSET 20000)');
+   this.update({lastDonationAt:Date.now()});
+   const waiting=this.ctx.storage.sql.exec<PendingResult>('SELECT id,payload,created FROM pending_results WHERE id=?',key).toArray()[0];
+   if(waiting)this.resolvePending(waiting);
+  }else{
+   const results=normalizeResults(message,identity);if(!results.length)return;
+   this.update({lastEventAt:Date.now()});
+   const envelope=resultEnvelope(message),uid=results[0].sourceEventId,key=uid?eventKey(identity,uid):null,donation=key?this.donation(key):null;
+   if(donation)this.enqueue(mergedResults(envelope,donation,identity),identity);
+   else if(key&&results[0].platform==='afreeca'&&results[0].status!=='ignored'&&(!results[0].soop||!results[0].nickname||!results[0].donation)){
+    if(this.matchingCount()>=QUEUE_LIMIT){this.update({running:false,connection:'degraded',lastError:'후원 정보 확인 대기열이 가득 찼습니다. 원본 결과를 대조해 주세요.'});this.close();return}
+    // The two independent connections can deliver a result before its donation.
+    const prior=this.ctx.storage.sql.exec<PendingResult>('SELECT id,payload,created FROM pending_results WHERE id=?',key).toArray()[0];
+    if(prior&&JSON.stringify(JSON.parse(prior.payload).message)!==JSON.stringify(envelope)){
+     const earlier=JSON.parse(prior.payload);earlier.message.data.mode='conflict';
+     this.ctx.storage.sql.exec('UPDATE pending_results SET payload=? WHERE id=?',JSON.stringify(earlier),key);
+     this.enqueue(results.map(r=>({...r,status:'review_required' as const,reason:'같은 후원 ID의 룰렛 결과가 달라 원본 확인이 필요합니다.'})),identity);
+    }else this.ctx.storage.sql.exec('INSERT OR IGNORE INTO pending_results(id,payload,created) VALUES(?,?,?)',key,JSON.stringify({message:envelope,identity}),Date.now());
+   }else this.enqueue(results,identity);
+  }
+  this.ctx.waitUntil(this.flush());this.ctx.waitUntil(this.schedule());
+ }
+ private resolvePending(row:PendingResult){
+  const {message,identity}=JSON.parse(row.payload),donation=this.donation(row.id);
+  if(!donation&&Date.now()<row.created+MATCH_WAIT_MS)return;
+  const results=donation?mergedResults(message,donation,identity):normalizeResults(message,identity);
+  if(this.enqueue(results,identity))this.ctx.storage.sql.exec('DELETE FROM pending_results WHERE id=?',row.id);
  }
  private async post(path:string,data:unknown){
   let origin:URL;
@@ -83,8 +167,33 @@ export class RouletteCollector extends DurableObject<Env>{
    this.update({lastReportError:message});
   }
  }
- private async schedule(){const s=this.state();if(!s.running&&!this.count()){await this.ctx.storage.deleteAlarm();return}const now=Date.now();const due=s.running&&this.socket?s.lastHeartbeatAt+s.pingInterval+s.pingTimeout:s.running?s.nextConnectAt||now+1000:now+30000;await this.ctx.storage.setAlarm(Math.max(now+1000,Math.min(due,now+(this.count()?15000:60000))))}
- async tick():Promise<void>{const s=this.state();if(s.running&&this.env.COLLECTOR_ENABLED!=='true'){this.update({running:false,connection:'stopped',generation:s.generation+1});this.close()}else if(s.running){if(this.socket&&Date.now()-s.lastHeartbeatAt>s.pingInterval+s.pingTimeout)this.failed(s.generation,'서버 응답이 지연되어 다시 연결합니다.');if(!this.socket&&!this.opening&&Date.now()>=this.state().nextConnectAt)await this.openSocket();if(Date.now()-s.lastCatalogAt>Number(this.env.CATALOG_SYNC_INTERVAL_SECONDS||1800)*1000&&Date.now()-s.lastCatalogAttemptAt>60000){this.update({lastCatalogAttemptAt:Date.now()});try{await this.post('/api/internal/weflab/catalog/sync',{});this.update({lastCatalogAt:Date.now(),lastCatalogError:null})}catch{this.update({lastCatalogError:'룰렛 목록을 갱신하지 못했습니다. 마지막 정상 목록을 사용합니다.'})}}}await this.flush();await this.report();await this.schedule()}
+ private async schedule(){
+  const s=this.state(),queued=this.count(),waiting=this.matchingCount();
+  if(!s.running&&!queued&&!waiting){await this.ctx.storage.deleteAlarm();return}
+  const now=Date.now(),deadlines=[now+(queued?15000:60000)];
+  if(s.running){
+   if(!this.links.size)deadlines.push(s.nextConnectAt||now+1000);
+   for(const link of this.links.values())deadlines.push(link.ready?link.lastHeartbeatAt+link.pingInterval+link.pingTimeout:link.connectDeadline);
+  }
+  if(waiting)deadlines.push(this.ctx.storage.sql.exec<{created:number}>('SELECT created FROM pending_results ORDER BY created LIMIT 1').one().created+MATCH_WAIT_MS);
+  await this.ctx.storage.setAlarm(Math.max(now+1000,Math.min(...deadlines)));
+ }
+ async tick():Promise<void>{
+  const s=this.state();
+  if(s.running&&this.env.COLLECTOR_ENABLED!=='true'){
+   this.update({running:false,connection:'stopped',generation:s.generation+1});this.close();
+  }else if(s.running){
+   if([...this.links.values()].some(link=>Date.now()>(link.ready?link.lastHeartbeatAt+link.pingInterval+link.pingTimeout:link.connectDeadline)))this.failed(s.generation,'수신 채널의 응답이 지연되어 다시 연결합니다.');
+   if(Date.now()>=this.state().nextConnectAt)await Promise.all(channels.map(channel=>this.openSocket(channel)));
+   if(Date.now()-s.lastCatalogAt>Number(this.env.CATALOG_SYNC_INTERVAL_SECONDS||1800)*1000&&Date.now()-s.lastCatalogAttemptAt>60000){
+    this.update({lastCatalogAttemptAt:Date.now()});
+    try{await this.post('/api/internal/weflab/catalog/sync',{});this.update({lastCatalogAt:Date.now(),lastCatalogError:null})}
+    catch{this.update({lastCatalogError:'룰렛 목록을 갱신하지 못했습니다. 마지막 정상 목록을 사용합니다.'})}
+   }
+  }
+  for(const row of this.ctx.storage.sql.exec<PendingResult>('SELECT id,payload,created FROM pending_results ORDER BY created LIMIT 50').toArray())this.resolvePending(row);
+  await this.flush();await this.report();await this.schedule();
+ }
  async alarm():Promise<void>{await this.tick()}
 }
 export default {
