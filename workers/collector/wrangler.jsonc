@@ -9,7 +9,8 @@
   "COLLECTOR_CONTROL_SECRET": "71f1f7b664136906a8e1cd166e0360c824c054d3d321699f0e9e1c2d27e7c76b",
   "COLLECTOR_ENABLED": "true",
   "COLLECTOR_INGEST_SECRET": "c617916450098d372583e4bf5da6214a9563c5cbc1cdecfa9882e7da6703f7b8",
-  "STREAMER_KEY": "jjosami"
+  "STREAMER_KEY": "jjosami",
+  "WEB_API_ORIGIN": "https://jjosam2.vercel.app"
  },
  "observability":{"enabled":true,"logs":{"invocation_logs":false}}
 }
